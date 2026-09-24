@@ -141,6 +141,28 @@ $ mcp cache clear                   # drop every server's
 - Reserved words `auth`, `logout`, `tools` and `help` shadow tools of the same
   name; reach those with `mcp <server> call <tool>`.
 
+## Release
+
+Update the version in `Cargo.toml`, refresh `Cargo.lock`, and commit the change.
+Then push `main` and a matching `v*` tag:
+
+```console
+$ cargo check
+$ git add Cargo.toml Cargo.lock
+$ git commit -m "chore: release v0.2.0"
+$ git push origin main
+$ git tag -a v0.2.0 -m v0.2.0
+$ git push origin v0.2.0
+```
+
+Pushing the tag runs the [release workflow](.github/workflows/release.yml), which
+builds a static `x86_64-unknown-linux-musl` binary and publishes it as
+`mcp-x86_64-unknown-linux-musl` on the GitHub release page. Check the result with:
+
+```console
+$ gh release view v0.2.0 --web
+```
+
 ## License
 
 MIT
