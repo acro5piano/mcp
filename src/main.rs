@@ -1,3 +1,4 @@
+mod cache;
 mod config;
 mod mcp;
 mod oauth;
@@ -48,12 +49,26 @@ enum Command {
     },
     /// Remove a server and its stored credentials
     Remove { name: String },
+    /// Manage the cached tool schemas
+    Cache {
+        #[command(subcommand)]
+        action: CacheCommand,
+    },
     /// List registered servers
     #[command(alias = "ls")]
     List,
     /// <server> [tool] [json-args] — run a tool on a registered server
     #[command(external_subcommand)]
     Server(Vec<String>),
+}
+
+#[derive(Subcommand)]
+enum CacheCommand {
+    /// Forget cached schemas, for one server or for every server
+    Clear {
+        /// Server to clear; omit to clear them all
+        server: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -75,6 +90,12 @@ async fn run() -> Result<ExitCode> {
         }
         Command::Remove { name } => {
             remove(&name)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Cache {
+            action: CacheCommand::Clear { server },
+        } => {
+            clear_cache(server.as_deref())?;
             Ok(ExitCode::SUCCESS)
         }
         Command::List => {
@@ -115,7 +136,20 @@ fn remove(name: &str) -> Result<()> {
     }
     config::save_config(&config)?;
     config::delete_credentials(name)?;
+    cache::clear(Some(name))?;
     eprintln!("Removed {name}");
+    Ok(())
+}
+
+fn clear_cache(server: Option<&str>) -> Result<()> {
+    let removed = cache::clear(server)?;
+    match (server, removed) {
+        (Some(name), 0) => eprintln!("No cached schemas for {name}"),
+        (Some(name), _) => eprintln!("Cleared cached schemas for {name}"),
+        (None, 0) => eprintln!("No cached schemas to clear"),
+        (None, 1) => eprintln!("Cleared cached schemas for 1 server"),
+        (None, n) => eprintln!("Cleared cached schemas for {n} servers"),
+    }
     Ok(())
 }
 
@@ -161,10 +195,12 @@ async fn server(args: Vec<String>) -> Result<ExitCode> {
     let mut args = args.into_iter();
     let name = args.next().expect("external subcommand always has a name");
     let rest: Vec<String> = args.collect();
+    let refresh = rest.iter().any(|a| a == "--refresh");
+    let rest: Vec<String> = rest.into_iter().filter(|a| a != "--refresh").collect();
 
     match rest.first().map(String::as_str) {
         None => {
-            print_tools(&name, false).await?;
+            print_tools(&name, false, refresh).await?;
             Ok(ExitCode::SUCCESS)
         }
         Some("auth" | "login") => {
@@ -178,7 +214,7 @@ async fn server(args: Vec<String>) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Some("tools") if rest.len() == 1 => {
-            print_tools(&name, true).await?;
+            print_tools(&name, true, refresh).await?;
             Ok(ExitCode::SUCCESS)
         }
         Some("--help" | "-h" | "help") => {
@@ -186,19 +222,20 @@ async fn server(args: Vec<String>) -> Result<ExitCode> {
             eprintln!("  mcp {name}            list the server's tools");
             eprintln!("  mcp {name} tools      the same list as raw JSON");
             eprintln!("  mcp {name} auth       authorize via the browser");
-            eprintln!("  mcp {name} logout     forget the stored credentials\n");
-            print_tools(&name, false).await?;
+            eprintln!("  mcp {name} logout     forget the stored credentials");
+            eprintln!("  mcp {name} --refresh  re-read the tool schemas, ignoring the cache\n");
+            print_tools(&name, false, refresh).await?;
             Ok(ExitCode::SUCCESS)
         }
         Some("call") => {
             let tool = rest
                 .get(1)
                 .ok_or_else(|| anyhow!("usage: mcp {name} call <tool> [json]"))?;
-            call(&name, tool, &rest[2..]).await
+            call(&name, tool, &rest[2..], refresh).await
         }
         Some(tool) => {
             let tool = tool.to_string();
-            call(&name, &tool, &rest[1..]).await
+            call(&name, &tool, &rest[1..], refresh).await
         }
     }
 }
@@ -303,9 +340,51 @@ async fn probe_challenge(http: &reqwest::Client, url: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-async fn print_tools(name: &str, as_json: bool) -> Result<()> {
+/// Tool schemas for a server, served from the cache when it is still fresh —
+/// which lets listing a server's tools stay a purely local operation.
+async fn tools_for(name: &str, expect: Option<&str>, refresh: bool) -> Result<Vec<Value>> {
+    let server = lookup(name)?;
+    if !refresh {
+        if let Some(tools) = cache::load(name, &server.url) {
+            // A tool missing from a cached list usually just means it is stale.
+            if expect.is_none_or(|tool| has_tool(&tools, tool)) {
+                return Ok(tools);
+            }
+        }
+    }
     let mut client = connect(name).await?;
-    let tools: Vec<Value> = client.list_tools().await?;
+    fetch_and_cache(name, &server.url, &mut client).await
+}
+
+/// The same, reusing a session we already opened.
+async fn tools_with(
+    client: &mut Client,
+    name: &str,
+    url: &str,
+    expect: Option<&str>,
+) -> Result<Vec<Value>> {
+    if let Some(tools) = cache::load(name, url) {
+        if expect.is_none_or(|tool| has_tool(&tools, tool)) {
+            return Ok(tools);
+        }
+    }
+    fetch_and_cache(name, url, client).await
+}
+
+async fn fetch_and_cache(name: &str, url: &str, client: &mut Client) -> Result<Vec<Value>> {
+    let tools = client.list_tools().await?;
+    cache::store(name, url, &tools)?;
+    Ok(tools)
+}
+
+fn has_tool(tools: &[Value], tool: &str) -> bool {
+    tools
+        .iter()
+        .any(|t| t.get("name").and_then(Value::as_str) == Some(tool))
+}
+
+async fn print_tools(name: &str, as_json: bool, refresh: bool) -> Result<()> {
+    let tools = tools_for(name, None, refresh).await?;
 
     if as_json {
         println!("{}", serde_json::to_string_pretty(&tools)?);
@@ -357,15 +436,16 @@ async fn print_tools(name: &str, as_json: bool) -> Result<()> {
     Ok(())
 }
 
-async fn call(name: &str, tool: &str, args: &[String]) -> Result<ExitCode> {
+async fn call(name: &str, tool: &str, args: &[String], refresh: bool) -> Result<ExitCode> {
     let raw = args.iter().any(|a| a == "--raw");
     let args: Vec<String> = args.iter().filter(|a| *a != "--raw").cloned().collect();
 
-    let mut client = connect(name).await?;
-
     if args.iter().any(|a| a == "--help" || a == "-h") {
-        return print_tool_help(&mut client, tool).await;
+        return print_tool_help(name, tool, refresh).await;
     }
+
+    let server = lookup(name)?;
+    let mut client = connect(name).await?;
 
     let arguments = match args.split_first() {
         None => Value::Object(Map::new()),
@@ -373,7 +453,11 @@ async fn call(name: &str, tool: &str, args: &[String]) -> Result<ExitCode> {
             parse_json_argument(first)?
         }
         Some(_) => {
-            let tools = client.list_tools().await?;
+            let tools = if refresh {
+                fetch_and_cache(name, &server.url, &mut client).await?
+            } else {
+                tools_with(&mut client, name, &server.url, Some(tool)).await?
+            };
             let schema = tools
                 .iter()
                 .find(|t| t.get("name").and_then(Value::as_str) == Some(tool))
@@ -389,8 +473,8 @@ async fn call(name: &str, tool: &str, args: &[String]) -> Result<ExitCode> {
             if error.to_string().to_lowercase().contains("not found")
                 || error.to_string().to_lowercase().contains("unknown tool")
             {
-                let names: Vec<String> = client
-                    .list_tools()
+                // Refetch rather than trust a cache the server just contradicted.
+                let names: Vec<String> = fetch_and_cache(name, &server.url, &mut client)
                     .await
                     .unwrap_or_default()
                     .iter()
@@ -409,8 +493,8 @@ async fn call(name: &str, tool: &str, args: &[String]) -> Result<ExitCode> {
 }
 
 /// Prints one tool's description and input schema.
-async fn print_tool_help(client: &mut Client, tool: &str) -> Result<ExitCode> {
-    let tools = client.list_tools().await?;
+async fn print_tool_help(name: &str, tool: &str, refresh: bool) -> Result<ExitCode> {
+    let tools = tools_for(name, Some(tool), refresh).await?;
     let found = tools
         .iter()
         .find(|t| t.get("name").and_then(Value::as_str) == Some(tool))

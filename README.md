@@ -72,6 +72,9 @@ $ mcp linear tools           # the same list, as raw JSON
 $ mcp linear get_issue --help  # one tool's input schema
 ```
 
+Schemas are cached for a day (see [Schema cache](#schema-cache)), so listing
+tools and resolving flags normally costs no round trip.
+
 ### Call tools
 
 Arguments can be a JSON object:
@@ -110,10 +113,31 @@ such as `{"issues": [...]}` is unwrapped so the payload is at the top level. Pas
 Progress goes to stderr and results to stdout, so pipes stay clean. A tool that
 reports an error prints to stderr and exits non-zero.
 
+### Schema cache
+
+`tools/list` is needed to list tools and to coerce `--flag` values, but schemas
+rarely change — so they are cached for **one day** under
+`~/.config/mcp/cache/<server>.json`. A warm `mcp <server>` is a local operation
+and needs no network or valid token at all.
+
+The cache invalidates itself when the day is up, when the server's URL changes,
+and when a tool you name is missing from the cached list (a sign it went stale
+early). To force a re-read explicitly:
+
+```console
+$ mcp linear --refresh              # also works on any tool call
+$ mcp cache clear linear            # drop one server's schemas
+$ mcp cache clear                   # drop every server's
+```
+
+`MCP_CACHE_TTL` overrides the lifetime in seconds; `0` disables caching.
+
 ## Notes
 
 - Transport is MCP **Streamable HTTP**, including `text/event-stream` responses.
 - `MCP_CONFIG_DIR` overrides the config location (default `~/.config/mcp`).
+- `add`, `remove`, `list` and `cache` are the built-in commands, so they shadow a
+  server with one of those names.
 - Reserved words `auth`, `logout`, `tools` and `help` shadow tools of the same
   name; reach those with `mcp <server> call <tool>`.
 
